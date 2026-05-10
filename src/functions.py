@@ -423,7 +423,7 @@ def formatar_numero_exportacao(valor: object) -> object:
 
 def calcular_necessidades(  # noqa: PLR0913
     sexo: object,
-    idade_anos: float,
+    idade_anos: int,
     altura_m: float,
     peso_kg: float,
     atividade: object = "moderado",
@@ -1085,7 +1085,7 @@ def numero_float_legivel(valor: object) -> float:
         return float(texto)
     try:
         return float(cast(Any, valor))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0.0
 
 
@@ -1100,7 +1100,7 @@ def numero_float_ou_nan(valor: object) -> float:
         return float(texto)
     try:
         return float(cast(Any, valor))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return float("nan")
 
 
@@ -1165,14 +1165,10 @@ def preparar_plano_humano(dieta: pd.DataFrame) -> pd.DataFrame:
         pd.Series, plano_any["Quantidade (g)"].map(numero_float_legivel)
     )
     quantidade_diaria_any = cast(Any, quantidade_diaria_exata)
-    plano_any["Quantidade diária (g)"] = quantidade_diaria_any.map(
-        arredondar_pratico
-    )
+    plano_any["Quantidade diária (g)"] = quantidade_diaria_any.map(arredondar_pratico)
     plano_any["Quantidade semanal (g)"] = (
         quantidade_diaria_exata * DIAS_POR_SEMANA
-    ).map(
-        arredondar_pratico
-    )
+    ).map(arredondar_pratico)
     plano_any["Quantidade mensal (g)"] = (quantidade_diaria_exata * DIAS_POR_MES).map(
         arredondar_pratico
     )
@@ -1252,9 +1248,7 @@ def preparar_cobertura_humana(cobertura: pd.DataFrame) -> pd.DataFrame:
 
     minimo = cobertura_any["Mínimo exigido"].replace(0, pd.NA)
     maximo = cobertura_any["Máximo permitido"].replace(0, pd.NA)
-    cobertura_any["% do mínimo"] = (
-        cobertura_any["Consumo estimado"] / minimo * 100
-    )
+    cobertura_any["% do mínimo"] = cobertura_any["Consumo estimado"] / minimo * 100
     cobertura_any["% do teto"] = cobertura_any["Consumo estimado"] / maximo * 100
     for coluna in [
         "Consumo estimado",
@@ -1294,3 +1288,127 @@ def formatar_tabela_exportacao(tabela: pd.DataFrame) -> pd.DataFrame:
     for coluna in exportacao_any.select_dtypes(include="number").columns:
         exportacao_any[coluna] = exportacao_any[coluna].map(formatar_numero_exportacao)
     return exportacao
+
+
+def faixas_amdr_por_calorias(
+    idade_anos: float,
+    calorias: float,
+) -> dict[str, FaixaAmdr]:
+    if idade_anos < IDADE_CRIANCA_4:
+        carb_pct, protein_pct, fat_pct = (0.45, 0.65), (0.05, 0.20), (0.30, 0.40)
+    elif idade_anos < IDADE_ADULTO:
+        carb_pct, protein_pct, fat_pct = (0.45, 0.65), (0.10, 0.30), (0.25, 0.35)
+    else:
+        carb_pct, protein_pct, fat_pct = (0.45, 0.65), (0.10, 0.35), (0.20, 0.35)
+
+    return {
+        "carboidrato": (calorias * carb_pct[0] / 4, calorias * carb_pct[1] / 4),
+        "proteina": (calorias * protein_pct[0] / 4, calorias * protein_pct[1] / 4),
+        "lipideos": (calorias * fat_pct[0] / 9, calorias * fat_pct[1] / 9),
+        "linoleico": (calorias * 0.05 / 9, calorias * 0.10 / 9),
+        "ala": (calorias * 0.006 / 9, calorias * 0.012 / 9),
+    }
+
+
+def definir_valores_nutriente(
+    tabela: pd.DataFrame,
+    nutriente: str,
+    alvo: float | None = None,
+    minimo: float | None = None,
+    maximo: float | None = None,
+) -> None:
+    tabela_any = cast(Any, tabela)
+    mascara = tabela_any["Nutriente"].eq(nutriente)
+    if alvo is not None:
+        tabela_any.loc[mascara, "Alvo"] = alvo
+    if minimo is not None:
+        tabela_any.loc[mascara, "Mínimo"] = minimo
+    if maximo is not None:
+        tabela_any.loc[mascara, "Máximo"] = maximo
+
+
+def aplicar_meta_calorica_para_lp(
+    necessidades: pd.DataFrame,
+    idade_anos: float,
+    deficit_kcal: float = 500,
+    meta_calorica_kcal: float | None = None,
+    tolerancia_abaixo: float = 0.05,
+) -> tuple[pd.DataFrame, dict[str, float], float]:
+    ajustadas = necessidades.copy()
+    ajustadas_any = cast(Any, ajustadas)
+    eer = float(ajustadas_any["EER usado (kcal/dia)"].iloc[0])
+    meta = (
+        float(meta_calorica_kcal)
+        if meta_calorica_kcal is not None
+        else eer - deficit_kcal
+    )
+    if meta <= 0:
+        raise ValueError("A meta calórica precisa ser maior que zero.")
+
+    calorias_minimas = meta * (1 - tolerancia_abaixo)
+    tolerancia_acima_para_lp = (meta / calorias_minimas) - 1
+    faixas = faixas_amdr_por_calorias(idade_anos, meta)
+
+    ajustadas_any["Meta calórica para LP (kcal/dia)"] = meta
+    ajustadas_any["Déficit aplicado (kcal/dia)"] = eer - meta
+
+    # The current LP builder uses the Energia row's Alvo as the lower bound and
+    # Alvo * (1 + tolerancia_energia_acima) as the upper bound.
+    definir_valores_nutriente(
+        ajustadas,
+        "Energia",
+        alvo=calorias_minimas,
+        minimo=calorias_minimas,
+        maximo=meta,
+    )
+    definir_valores_nutriente(
+        ajustadas,
+        "Carboidrato",
+        minimo=faixas["carboidrato"][0],
+        maximo=faixas["carboidrato"][1],
+    )
+    definir_valores_nutriente(
+        ajustadas,
+        "Proteína",
+        minimo=faixas["proteina"][0],
+        maximo=faixas["proteina"][1],
+    )
+    definir_valores_nutriente(
+        ajustadas,
+        "Lipídeos totais",
+        minimo=faixas["lipideos"][0],
+        maximo=faixas["lipideos"][1],
+    )
+    definir_valores_nutriente(
+        ajustadas,
+        "Fibra Alimentar",
+        alvo=meta * 14 / 1000,
+        minimo=meta * 14 / 1000,
+    )
+    definir_valores_nutriente(
+        ajustadas,
+        "Ácidos graxos saturados",
+        maximo=meta * 0.10 / 9,
+    )
+    definir_valores_nutriente(
+        ajustadas,
+        "Ácido linoleico n-6",
+        minimo=faixas["linoleico"][0],
+        maximo=faixas["linoleico"][1],
+    )
+    definir_valores_nutriente(
+        ajustadas,
+        "Ácido alfa-linolênico n-3",
+        minimo=faixas["ala"][0],
+        maximo=faixas["ala"][1],
+    )
+
+    resumo = {
+        "EER original (kcal/dia)": eer,
+        "Meta calórica (kcal/dia)": meta,
+        "Déficit (kcal/dia)": eer - meta,
+        "Mínimo energético LP (kcal/dia)": calorias_minimas,
+        "Máximo energético LP (kcal/dia)": meta,
+        "Tolerância superior enviada ao LP": tolerancia_acima_para_lp,
+    }
+    return ajustadas, resumo, tolerancia_acima_para_lp
