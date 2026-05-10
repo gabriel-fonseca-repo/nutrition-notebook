@@ -53,6 +53,15 @@ COLUNAS_IDENTIFICACAO = [
     "Categoria do Alimento",
     "Descrição dos Alimentos",
 ]
+DIAS_POR_SEMANA = 7
+DIAS_POR_MES = 30
+LIMIAR_ARREDONDAR_5G = 100
+LIMIAR_ARREDONDAR_1G = 20
+LIMIAR_ARREDONDAR_05G = 5
+LIMIAR_FORMATO_DIARIO = 80
+LIMIAR_FORMATO_SEMANAL = 10
+LIMIAR_PORCAO_DIARIA_ALTA = 300
+LIMIAR_MICROQUANTIDADE = 10
 
 
 def limpar_rotulo(coluna: str) -> str:
@@ -812,7 +821,9 @@ def preparar_taco_para_lp(tabela_base: pd.DataFrame) -> pd.DataFrame:
 
     for coluna in colunas:
         if coluna not in COLUNAS_IDENTIFICACAO:
-            taco[coluna] = converter_coluna_numerica_lp(taco[coluna])
+            taco[coluna] = converter_coluna_numerica_lp(
+                cast(pd.Series, cast(Any, taco)[coluna])
+            )
 
     return taco
 
@@ -858,7 +869,7 @@ def vetor_nutriente_lp(
         for coluna_preferida in ["RAE (mcg)", "RE (mcg)", "Retinol (mcg)"]:
             if coluna_preferida not in candidatos.columns:
                 continue
-            serie_preferida = candidatos[coluna_preferida]
+            serie_preferida = cast(pd.Series, cast(Any, candidatos)[coluna_preferida])
             serie_preferida_any = cast(Any, serie_preferida)
             maior_valor = numero_lp(serie_preferida_any.max()) or 0
             if maior_valor > 0:
@@ -1061,3 +1072,225 @@ def otimizar_dieta_lp(  # noqa: PLR0913
     }
 
     return resumo, dieta, cobertura
+
+
+def numero_float_legivel(valor: object) -> float:
+    if _is_missing_scalar(valor):
+        return 0.0
+    if isinstance(valor, str):
+        texto = valor.strip()
+        if not texto:
+            return 0.0
+        texto = texto.replace(".", "").replace(",", ".") if "," in texto else texto
+        return float(texto)
+    try:
+        return float(cast(Any, valor))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def numero_float_ou_nan(valor: object) -> float:
+    if _is_missing_scalar(valor):
+        return float("nan")
+    if isinstance(valor, str):
+        texto = valor.strip()
+        if not texto:
+            return float("nan")
+        texto = texto.replace(".", "").replace(",", ".") if "," in texto else texto
+        return float(texto)
+    try:
+        return float(cast(Any, valor))
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def arredondar_pratico(valor: object) -> float:
+    valor = float(cast(Any, valor))
+    if valor >= LIMIAR_ARREDONDAR_5G:
+        base = 5
+    elif valor >= LIMIAR_ARREDONDAR_1G:
+        base = 1
+    elif valor >= LIMIAR_ARREDONDAR_05G:
+        base = 0.5
+    else:
+        base = 0.1
+    return round(valor / base) * base
+
+
+def formatar_quantidade(valor: object, unidade: str = "g") -> str:
+    valor = arredondar_pratico(valor)
+    texto = formatar_numero_exportacao(valor)
+    return f"{texto} {unidade}"
+
+
+def formato_sugerido(gramas_dia: object) -> str:
+    gramas_dia = float(cast(Any, gramas_dia))
+    gramas_semana = gramas_dia * DIAS_POR_SEMANA
+    gramas_mes = gramas_dia * DIAS_POR_MES
+
+    if gramas_dia >= LIMIAR_FORMATO_DIARIO:
+        return f"{formatar_quantidade(gramas_dia)} por dia"
+    if gramas_dia >= LIMIAR_FORMATO_SEMANAL:
+        return (
+            f"{formatar_quantidade(gramas_semana)} por semana "
+            f"(~{formatar_quantidade(gramas_dia)}/dia)"
+        )
+    if gramas_semana >= LIMIAR_FORMATO_SEMANAL:
+        return f"{formatar_quantidade(gramas_semana)} por semana"
+    return f"{formatar_quantidade(gramas_mes)} por mês"
+
+
+def observacao_pratica(descricao: object, gramas_dia: float) -> str:
+    descricao_normalizada = str(descricao).lower()
+    alertas: list[str] = []
+    if gramas_dia >= LIMIAR_PORCAO_DIARIA_ALTA:
+        alertas.append("porção diária alta")
+    if gramas_dia < LIMIAR_MICROQUANTIDADE:
+        alertas.append("microquantidade; mais fácil planejar por semana")
+    if any(termo in descricao_normalizada for termo in ["cru", "pó", "semente"]):
+        alertas.append("peso da TACO pode mudar após preparo")
+    if any(
+        termo in descricao_normalizada for termo in ["doce", "marmelada", "gelatina"]
+    ):
+        alertas.append(
+            "item denso em açúcar; revisar se quiser um cardápio mais realista"
+        )
+    return "; ".join(alertas)
+
+
+def preparar_plano_humano(dieta: pd.DataFrame) -> pd.DataFrame:
+    plano = dieta.copy()
+    plano_any = cast(Any, plano)
+    quantidade_diaria_exata = cast(
+        pd.Series, plano_any["Quantidade (g)"].map(numero_float_legivel)
+    )
+    quantidade_diaria_any = cast(Any, quantidade_diaria_exata)
+    plano_any["Quantidade diária (g)"] = quantidade_diaria_any.map(
+        arredondar_pratico
+    )
+    plano_any["Quantidade semanal (g)"] = (
+        quantidade_diaria_exata * DIAS_POR_SEMANA
+    ).map(
+        arredondar_pratico
+    )
+    plano_any["Quantidade mensal (g)"] = (quantidade_diaria_exata * DIAS_POR_MES).map(
+        arredondar_pratico
+    )
+    plano_any["Formato sugerido"] = quantidade_diaria_any.map(formato_sugerido)
+
+    def observacao_linha(linha: Any) -> str:
+        return observacao_pratica(
+            linha["Descrição dos Alimentos"],
+            numero_float_legivel(linha["Quantidade diária (g)"]),
+        )
+
+    plano_any["Observação prática"] = plano_any.apply(observacao_linha, axis=1)
+
+    arredondamentos = {
+        "Energia (kcal) no plano": 0,
+        "Proteína (g) no plano": 1,
+        "Carboidrato (g) no plano": 1,
+        "Lipídeos (g) no plano": 1,
+        "Fibra Alimentar (g) no plano": 1,
+        "Sódio (mg) no plano": 0,
+    }
+    for coluna, casas_decimais in arredondamentos.items():
+        if coluna in plano_any.columns:
+            plano_any[coluna] = (
+                plano_any[coluna].map(numero_float_legivel).round(casas_decimais)
+            )
+
+    colunas_resultado = [
+        "Descrição dos Alimentos",
+        "Categoria do Alimento",
+        "Formato sugerido",
+        "Quantidade diária (g)",
+        "Quantidade semanal (g)",
+        "Quantidade mensal (g)",
+        "Energia (kcal) no plano",
+        "Proteína (g) no plano",
+        "Carboidrato (g) no plano",
+        "Lipídeos (g) no plano",
+        "Fibra Alimentar (g) no plano",
+        "Sódio (mg) no plano",
+        "Observação prática",
+    ]
+    colunas_resultado = [
+        coluna for coluna in colunas_resultado if coluna in plano_any.columns
+    ]
+    return cast(
+        pd.DataFrame,
+        plano_any[colunas_resultado]
+        .sort_values("Quantidade diária (g)", ascending=False)
+        .reset_index(drop=True),
+    )
+
+
+def preparar_resumo_categorias(plano: pd.DataFrame) -> pd.DataFrame:
+    plano_any = cast(Any, plano)
+    resumo = (
+        plano_any.groupby("Categoria do Alimento", as_index=False)
+        .agg(
+            Alimentos=("Descrição dos Alimentos", "count"),
+            **{
+                "Total diário (g)": ("Quantidade diária (g)", "sum"),
+                "Total semanal (g)": ("Quantidade semanal (g)", "sum"),
+                "Energia diária (kcal)": ("Energia (kcal) no plano", "sum"),
+            },
+        )
+        .sort_values("Total diário (g)", ascending=False)
+        .reset_index(drop=True)
+    )
+    return cast(pd.DataFrame, resumo)
+
+
+def preparar_cobertura_humana(cobertura: pd.DataFrame) -> pd.DataFrame:
+    cobertura_humana = cobertura.copy()
+    cobertura_any = cast(Any, cobertura_humana)
+    for coluna in ["Consumo estimado", "Mínimo exigido", "Máximo permitido"]:
+        cobertura_any[coluna] = cobertura_any[coluna].map(numero_float_ou_nan)
+
+    minimo = cobertura_any["Mínimo exigido"].replace(0, pd.NA)
+    maximo = cobertura_any["Máximo permitido"].replace(0, pd.NA)
+    cobertura_any["% do mínimo"] = (
+        cobertura_any["Consumo estimado"] / minimo * 100
+    )
+    cobertura_any["% do teto"] = cobertura_any["Consumo estimado"] / maximo * 100
+    for coluna in [
+        "Consumo estimado",
+        "Mínimo exigido",
+        "Máximo permitido",
+        "% do mínimo",
+        "% do teto",
+    ]:
+        to_numeric: Any = pd.to_numeric  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        cobertura_any[coluna] = to_numeric(
+            cobertura_any[coluna], errors="coerce"
+        ).round(1)
+    cobertura_any["Status"] = cobertura_any["Atendeu"].map(
+        {True: "OK", False: "Revisar"}
+    )
+
+    return cast(
+        pd.DataFrame,
+        cobertura_any[
+            [
+                "Nutriente",
+                "Consumo estimado",
+                "Mínimo exigido",
+                "Máximo permitido",
+                "% do mínimo",
+                "% do teto",
+                "Unidade",
+                "Status",
+            ]
+        ],
+    )
+
+
+def formatar_tabela_exportacao(tabela: pd.DataFrame) -> pd.DataFrame:
+    exportacao = tabela.copy()
+    exportacao_any = cast(Any, exportacao)
+    for coluna in exportacao_any.select_dtypes(include="number").columns:
+        exportacao_any[coluna] = exportacao_any[coluna].map(formatar_numero_exportacao)
+    return exportacao
