@@ -3,8 +3,12 @@ import re
 from collections.abc import Sequence
 from decimal import Decimal, InvalidOperation
 from numbers import Real
+from typing import Any, TypedDict, cast
 
+import numpy as np
 import pandas as pd
+from numpy.typing import NDArray
+from scipy.optimize import linprog  # pyright: ignore[reportUnknownVariableType]
 
 from constants import (
     ATIVIDADE_ALIASES,
@@ -31,6 +35,24 @@ from constants import (
 
 type FaixaAmdr = tuple[float, float]
 type LinhaNecessidade = dict[str, str | int | float | None]
+type ArrayFloat = NDArray[np.float64]
+type ResumoLp = dict[str, str | int | float]
+
+
+class MetaLp(TypedDict):
+    nutriente: str
+    colunas_taco_usadas: str
+    minimo_exigido: float | None
+    maximo_permitido: float | None
+    unidade: str
+    vetor: ArrayFloat
+
+
+COLUNAS_IDENTIFICACAO = [
+    "Número do Alimento",
+    "Categoria do Alimento",
+    "Descrição dos Alimentos",
+]
 
 
 def limpar_rotulo(coluna: str) -> str:
@@ -739,3 +761,303 @@ def calcular_necessidades(  # noqa: PLR0913
     resultado.insert(0, "Estágio de vida", estagio)
     resultado.insert(1, "EER usado (kcal/dia)", round(eer))
     return resultado
+
+
+def converter_coluna_numerica_lp(serie: pd.Series) -> pd.Series:
+    serie_any = cast(Any, serie)
+    texto = cast(pd.Series, serie_any.astype(str).str.strip())
+    texto_any = cast(Any, texto)
+    texto = cast(
+        pd.Series,
+        texto_any.replace({"": pd.NA, "NA": pd.NA, "nan": pd.NA, "None": pd.NA}),
+    )
+    texto_any = cast(Any, texto)
+    tem_decimal_brasileiro = cast(
+        bool, texto_any.str.contains(",", regex=False, na=False).any()
+    )
+    if tem_decimal_brasileiro:
+        texto = cast(
+            pd.Series,
+            texto_any.str.replace(".", "", regex=False).str.replace(
+                ",", ".", regex=False
+            ),
+        )
+    to_numeric: Any = pd.to_numeric  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+    numeros = cast(pd.Series, to_numeric(texto, errors="coerce"))
+    return cast(pd.Series, cast(Any, numeros).fillna(0))
+
+
+def numero_lp(valor: object) -> float | None:
+    if _is_missing_scalar(valor):
+        return None
+    if isinstance(valor, str):
+        texto = valor.strip()
+        if not texto:
+            return None
+        texto = texto.replace(".", "").replace(",", ".") if "," in texto else texto
+        return float(texto)
+    try:
+        return float(cast(Any, valor))
+    except TypeError, ValueError:
+        return None
+
+
+def preparar_taco_para_lp(tabela_base: pd.DataFrame) -> pd.DataFrame:
+    taco = tabela_base.copy()
+    colunas = [
+        limpar_rotulo(str(coluna))
+        for coluna in cast(Sequence[object], tabela_base.columns)
+    ]
+    taco.columns = colunas
+
+    for coluna in colunas:
+        if coluna not in COLUNAS_IDENTIFICACAO:
+            taco[coluna] = converter_coluna_numerica_lp(taco[coluna])
+
+    return taco
+
+
+def filtrar_candidatos_lp(
+    taco: pd.DataFrame,
+    categorias_permitidas: Sequence[str] | None = None,
+    termos_excluidos: Sequence[str] | list[str] | None = None,
+) -> pd.DataFrame:
+    candidatos = taco.copy()
+    mascara = cast(pd.Series, candidatos["Energia (kcal)"] > 0)
+
+    if categorias_permitidas:
+        categorias = cast(Any, candidatos["Categoria do Alimento"])
+        mascara = cast(
+            pd.Series,
+            cast(Any, mascara) & categorias.isin(categorias_permitidas),
+        )
+
+    descricoes_coluna = cast(Any, candidatos["Descrição dos Alimentos"])
+    descricoes = cast(
+        pd.Series,
+        descricoes_coluna.fillna("").str.lower(),
+    )
+    descricoes_any = cast(Any, descricoes)
+    for termo in termos_excluidos or []:
+        mascara = cast(
+            pd.Series,
+            cast(Any, mascara)
+            & ~descricoes_any.str.contains(str(termo).lower(), regex=False),
+        )
+
+    return cast(pd.DataFrame, cast(Any, candidatos).loc[mascara].reset_index(drop=True))
+
+
+def vetor_nutriente_lp(
+    candidatos: pd.DataFrame,
+    nutriente: str,
+    colunas: Sequence[str],
+) -> tuple[ArrayFloat | None, list[str]]:
+    # RAE, RE and Retinol are alternative vitamin-A measures, not additive targets.
+    if nutriente == "Vitamina A":
+        for coluna_preferida in ["RAE (mcg)", "RE (mcg)", "Retinol (mcg)"]:
+            if coluna_preferida not in candidatos.columns:
+                continue
+            serie_preferida = candidatos[coluna_preferida]
+            serie_preferida_any = cast(Any, serie_preferida)
+            maior_valor = numero_lp(serie_preferida_any.max()) or 0
+            if maior_valor > 0:
+                vetor = cast(ArrayFloat, serie_preferida_any.to_numpy(dtype=float))
+                return vetor, [coluna_preferida]
+
+    colunas_existentes = [coluna for coluna in colunas if coluna in candidatos.columns]
+    if not colunas_existentes:
+        return None, []
+
+    soma = cast(pd.Series, cast(Any, candidatos[colunas_existentes]).sum(axis=1))
+    vetor = cast(ArrayFloat, cast(Any, soma).to_numpy(dtype=float))
+    return vetor, colunas_existentes
+
+
+def montar_modelo_lp(
+    candidatos: pd.DataFrame,
+    necessidades: pd.DataFrame,
+    tolerancia_energia_acima: float = 0.05,
+) -> tuple[ArrayFloat, ArrayFloat, list[MetaLp]]:
+    a_ub: list[ArrayFloat] = []
+    b_ub: list[float] = []
+    metas: list[MetaLp] = []
+
+    linhas = cast(list[dict[str, object]], cast(Any, necessidades).to_dict("records"))
+    for linha in linhas:
+        tipo = str(linha.get("Tipo", ""))
+        maximo = numero_lp(linha.get("Máximo"))
+
+        if tipo in {"sem DRI individual", "sem RDA/AI"} and maximo is None:
+            continue
+
+        colunas = [
+            coluna.strip()
+            for coluna in str(linha.get("Colunas TACO usadas", "")).split(",")
+            if coluna.strip()
+        ]
+        nutriente = str(linha["Nutriente"])
+        vetor, colunas_usadas = vetor_nutriente_lp(candidatos, nutriente, colunas)
+        if vetor is None or not colunas_usadas:
+            continue
+
+        alvo = numero_lp(linha.get("Alvo"))
+        minimo = numero_lp(linha.get("Mínimo"))
+        lower_candidates = [valor for valor in [alvo, minimo] if valor is not None]
+        minimo_exigido = max(lower_candidates) if lower_candidates else None
+        maximo_permitido = maximo
+
+        if nutriente == "Energia":
+            if alvo is None:
+                continue
+            minimo_exigido = alvo
+            maximo_permitido = alvo * (1 + tolerancia_energia_acima)
+
+        if nutriente == "Colesterol":
+            minimo_exigido = None
+
+        if minimo_exigido is None and maximo_permitido is None:
+            continue
+
+        if minimo_exigido is not None and minimo_exigido > 0:
+            a_ub.append(-vetor)
+            b_ub.append(-minimo_exigido)
+
+        if maximo_permitido is not None and maximo_permitido >= 0:
+            a_ub.append(vetor)
+            b_ub.append(maximo_permitido)
+
+        metas.append(
+            {
+                "nutriente": nutriente,
+                "colunas_taco_usadas": ", ".join(colunas_usadas),
+                "minimo_exigido": minimo_exigido,
+                "maximo_permitido": maximo_permitido,
+                "unidade": str(linha.get("Unidade", "")),
+                "vetor": vetor,
+            }
+        )
+
+    return np.array(a_ub, dtype=float), np.array(b_ub, dtype=float), metas
+
+
+def avaliar_cobertura_lp(
+    metas: Sequence[MetaLp],
+    porcoes_100g: ArrayFloat,
+) -> pd.DataFrame:
+    linhas: list[LinhaNecessidade | dict[str, bool | float | str | None]] = []
+    for meta in metas:
+        consumo = float(np.dot(meta["vetor"], porcoes_100g))
+        minimo = meta["minimo_exigido"]
+        maximo = meta["maximo_permitido"]
+        atende_minimo = minimo is None or consumo + 1e-7 >= minimo
+        atende_maximo = maximo is None or consumo <= maximo + 1e-7
+        linhas.append(
+            {
+                "Nutriente": meta["nutriente"],
+                "Colunas TACO usadas": meta["colunas_taco_usadas"],
+                "Consumo estimado": consumo,
+                "Mínimo exigido": minimo,
+                "Máximo permitido": maximo,
+                "Unidade": meta["unidade"],
+                "Atendeu": atende_minimo and atende_maximo,
+            }
+        )
+    return pd.DataFrame(linhas)
+
+
+def otimizar_dieta_lp(  # noqa: PLR0913
+    tabela_base: pd.DataFrame,
+    necessidades: pd.DataFrame,
+    max_gramas_por_alimento: float | None = 500,
+    tolerancia_energia_acima: float = 0.05,
+    categorias_permitidas: Sequence[str] | None = None,
+    termos_excluidos: Sequence[str] | list[str] | None = None,
+    min_gramas_para_exibir: float = 0.1,
+) -> tuple[ResumoLp, pd.DataFrame, pd.DataFrame]:
+    taco_lp = preparar_taco_para_lp(tabela_base)
+    candidatos = filtrar_candidatos_lp(
+        taco_lp,
+        categorias_permitidas=categorias_permitidas,
+        termos_excluidos=termos_excluidos,
+    )
+
+    a_ub, b_ub, metas = montar_modelo_lp(
+        candidatos,
+        necessidades,
+        tolerancia_energia_acima=tolerancia_energia_acima,
+    )
+
+    custo = np.ones(len(candidatos), dtype=float) * 100
+    limite_superior = (
+        None if max_gramas_por_alimento is None else max_gramas_por_alimento / 100
+    )
+    limites = [(0, limite_superior) for _ in range(len(candidatos))]
+
+    resultado: Any = linprog(
+        c=custo,
+        A_ub=a_ub,
+        b_ub=b_ub,
+        bounds=limites,
+        method="highs",
+    )
+
+    if not resultado.success:
+        restricoes = pd.DataFrame(
+            [
+                {
+                    "Nutriente": meta["nutriente"],
+                    "Colunas TACO usadas": meta["colunas_taco_usadas"],
+                    "Mínimo exigido": meta["minimo_exigido"],
+                    "Máximo permitido": meta["maximo_permitido"],
+                    "Unidade": meta["unidade"],
+                }
+                for meta in metas
+            ]
+        )
+        raise RuntimeError(
+            "O problema de programação linear não encontrou solução: "
+            f"{resultado.message}\n"
+            "Tente aumentar MAX_GRAMAS_POR_ALIMENTO, relaxar "
+            "TOLERANCIA_ENERGIA_ACIMA ou remover algumas restrições/categorias.\n"
+            f"Restrições montadas: {len(restricoes)}"
+        )
+
+    porcoes = cast(ArrayFloat, resultado.x)
+    gramas = porcoes * 100
+    selecionados = gramas >= min_gramas_para_exibir
+
+    dieta = cast(
+        pd.DataFrame,
+        cast(Any, candidatos).loc[selecionados, COLUNAS_IDENTIFICACAO].copy(),
+    )
+    dieta.insert(3, "Quantidade (g)", gramas[selecionados])
+    dieta.insert(4, "Porções de 100 g", porcoes[selecionados])
+
+    for coluna in [
+        "Energia (kcal)",
+        "Proteína (g)",
+        "Carboidrato (g)",
+        "Lipídeos (g)",
+        "Fibra Alimentar (g)",
+        "Sódio (mg)",
+    ]:
+        if coluna in candidatos.columns:
+            valores = cast(
+                ArrayFloat,
+                cast(Any, candidatos).loc[selecionados, coluna].to_numpy(dtype=float),
+            )
+            dieta[f"{coluna} no plano"] = valores * porcoes[selecionados]
+
+    dieta = dieta.sort_values("Quantidade (g)", ascending=False).reset_index(drop=True)
+    cobertura = avaliar_cobertura_lp(metas, porcoes)
+
+    resumo: ResumoLp = {
+        "status": str(resultado.message),
+        "total_gramas": float(gramas.sum()),
+        "alimentos_usados": int(selecionados.sum()),
+        "candidatos_avaliados": len(candidatos),
+        "restricoes_ativas": len(metas),
+    }
+
+    return resumo, dieta, cobertura
