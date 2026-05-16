@@ -853,7 +853,7 @@ def filtrar_candidatos_lp(
         mascara = cast(
             pd.Series,
             cast(Any, mascara)
-            & ~descricoes_any.str.contains(str(termo).lower(), regex=False),
+            & ~descricoes_any.str.contains(termo.lower(), regex=False),
         )
 
     return cast(pd.DataFrame, cast(Any, candidatos).loc[mascara].reset_index(drop=True))
@@ -1337,11 +1337,7 @@ def aplicar_meta_calorica_para_lp(
     ajustadas = necessidades.copy()
     ajustadas_any = cast(Any, ajustadas)
     eer = float(ajustadas_any["EER usado (kcal/dia)"].iloc[0])
-    meta = (
-        float(meta_calorica_kcal)
-        if meta_calorica_kcal is not None
-        else eer - deficit_kcal
-    )
+    meta = meta_calorica_kcal if meta_calorica_kcal is not None else eer - deficit_kcal
     if meta <= 0:
         raise ValueError("A meta calórica precisa ser maior que zero.")
 
